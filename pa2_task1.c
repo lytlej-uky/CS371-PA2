@@ -51,6 +51,7 @@ typedef struct {
     int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
     int socket_fd;       /* File descriptor for the client socket connected to the server. */
     long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
+    struct sockaddr_in server_addr;
     long total_messages; /* Total number of messages sent and received. */
     float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
 } client_thread_data_t;
@@ -58,50 +59,51 @@ typedef struct {
 /*
  * This function runs in a separate client thread to handle communication with the server
  */
-void *client_thread_func(void *arg) {
+ void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event, events[MAX_EVENTS];
-    char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; /* Send 16-Bytes message every time */
+    char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; // 16-byte message
     char recv_buf[MESSAGE_SIZE];
     struct timeval start, end;
 
-    // Register the "connected" client_thread's socket in its epoll instance
-    event.events = EPOLLOUT;
+    // Register the socket in the epoll instance
+    event.events = EPOLLOUT; // Start by monitoring for readiness to send
     event.data.fd = data->socket_fd;
 
-    // Add the socket to the epoll instance
     if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) == -1) {
         perror("epoll_ctl");
         pthread_exit(NULL);
     }
 
-    // Set initial values to 0
     data->total_rtt = 0;
     data->total_messages = 0;
     data->request_rate = 0.0;
 
     for (int i = 0; i < num_requests; i++) {
-        // Send message to server
+        // Send message to the server
         gettimeofday(&start, NULL);
-        if (send(data->socket_fd, send_buf, MESSAGE_SIZE, 0) == -1) {
-            perror("send");
-            pthread_exit(NULL);
-        }
-
-        // Wait for response from server
+        if (sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,
+            (struct sockaddr *)&data->server_addr, sizeof(data->server_addr)) == -1) {
+                perror("sendto");
+                pthread_exit(NULL);
+            }
+            
+        // Wait for the socket to be ready
         int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
         if (wait_return == -1) {
             perror("epoll_wait");
             pthread_exit(NULL);
         }
 
-        // Receive message from server
-        if (recv(data->socket_fd, recv_buf, MESSAGE_SIZE, 0) == -1) {
-            perror("recv");
+        // Receive response from the server
+        socklen_t server_len = sizeof(data->server_addr);
+        if (recvfrom(data->socket_fd, recv_buf, MESSAGE_SIZE, 0,
+                 (struct sockaddr *)&data->server_addr, &server_len) == -1) {
+            perror("recvfrom");
             pthread_exit(NULL);
         }
 
-        // Get end time and update totals
+        // Calculate RTT
         gettimeofday(&end, NULL);
         data->total_messages++;
         data->total_rtt += (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
@@ -110,7 +112,6 @@ void *client_thread_func(void *arg) {
     // Calculate request rate
     data->request_rate = (float)data->total_messages / (data->total_rtt / 1000000.0);
 
-    // Close the socket and epoll instance
     close(data->socket_fd);
     close(data->epoll_fd);
 
@@ -120,10 +121,9 @@ void *client_thread_func(void *arg) {
 void run_client() {
     pthread_t threads[num_client_threads];
     client_thread_data_t thread_data[num_client_threads];
-    struct sockaddr_in server_addr;
 
     for (int i = 0; i < num_client_threads; i++) {
-        thread_data[i].socket_fd = socket(AF_INET, SOCK_STREAM, 0); // create socket using SOCK_STREAM
+        thread_data[i].socket_fd = socket(AF_INET, SOCK_DGRAM, 0); // create socket using SOCK_DGRAM
         if (thread_data[i].socket_fd == -1) { // check if the socket was created correctly
             perror("socket");
             exit(EXIT_FAILURE);
@@ -135,17 +135,11 @@ void run_client() {
             exit(EXIT_FAILURE);
         }
 
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(server_port);
+        thread_data[i].server_addr.sin_family = AF_INET;
+        thread_data[i].server_addr.sin_port = htons(server_port);
         // convert IPv4 address from text to binary form
-        if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        if (inet_pton(AF_INET, server_ip, &thread_data[i].server_addr.sin_addr) <= 0) {
             perror("inet_pton");
-            exit(EXIT_FAILURE);
-        }
-
-        // connect to the server
-        if (connect(thread_data[i].socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
-            perror("connect");
             exit(EXIT_FAILURE);
         }
     }
@@ -179,14 +173,17 @@ void run_server() {
     int epoll_fd;
     struct epoll_event event;
     struct epoll_event events[MAX_EVENTS];
+    char recv_buf[MESSAGE_SIZE];
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // Create a UDP socket
+    server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (server_fd == -1) {
         perror("socket");
         exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(server_port);
@@ -194,13 +191,6 @@ void run_server() {
     // bind the server to the ip and port
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
         perror("bind");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    // listen for incoming connections
-    if (listen(server_fd, SOMAXCONN) == -1) {
-        perror("listen");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
@@ -236,31 +226,13 @@ void run_server() {
         // for each event received, handle it
         for (int i = 0; i < num_events; i++) {
             if (events[i].data.fd == server_fd) {
-                // accept the incoming connection
-                int client_fd = accept(server_fd, NULL, NULL);
-                if (client_fd == -1) {
-                    perror("accept");
-                    continue; // if one errors try the next
-                }
-                
-                // add the client socket to the epoll instance
-                event.events = EPOLLIN;
-                event.data.fd = client_fd;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
-                    perror("epoll_ctl");
-                    close(client_fd);
-                    continue; // if one errors try the next
-                }
-            } else {
-                // existing connection receive data
-                char recv_buf[MESSAGE_SIZE];
-                if (recv(events[i].data.fd, recv_buf, MESSAGE_SIZE, 0) <= 0) {
-                    close(events[i].data.fd);
+                // Receive data from a client
+                if (recvfrom(server_fd, recv_buf, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, &client_len) == -1) {
+                    perror("recvfrom");
                 } else {
-                    // send acknowledge message
-                    if (send(events[i].data.fd, recv_buf, MESSAGE_SIZE, 0) == -1) {
-                        perror("send");
-                        close(events[i].data.fd);
+                    // Echo the data back to the client
+                    if (sendto(server_fd, recv_buf, n, 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                        perror("sendto");
                     }
                 }
             }
