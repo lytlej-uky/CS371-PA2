@@ -76,10 +76,6 @@ typedef struct {
         perror("setsockopt (SO_RCVTIMEO)");
         pthread_exit(NULL);
     }
-    if (setsockopt(data->socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == -1) {
-        perror("setsockopt (SO_SNDTIMEO)");
-        pthread_exit(NULL);
-    }
 
     // Register the socket in the epoll instance
     event.events = EPOLLOUT; // Start by monitoring for readiness to send
