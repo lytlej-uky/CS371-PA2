@@ -227,7 +227,8 @@ void run_server() {
         for (int i = 0; i < num_events; i++) {
             if (events[i].data.fd == server_fd) {
                 // Receive data from a client
-                if (recvfrom(server_fd, recv_buf, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, &client_len) == -1) {
+                int n = recvfrom(server_fd, recv_buf, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, &client_len);
+                if (n <= 0) {
                     perror("recvfrom");
                 } else {
                     // Echo the data back to the client
