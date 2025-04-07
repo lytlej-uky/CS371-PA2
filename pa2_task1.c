@@ -50,6 +50,8 @@ int num_requests = 1000000;
 typedef struct {
     int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
     int socket_fd;       /* File descriptor for the client socket connected to the server. */
+    long long tx_cnt;
+    long long rx_cnt;
     long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
     struct sockaddr_in server_addr;
     long total_messages; /* Total number of messages sent and received. */
@@ -66,6 +68,19 @@ typedef struct {
     char recv_buf[MESSAGE_SIZE];
     struct timeval start, end;
 
+    struct timeval timeout;
+    timeout.tv_sec = 1;  // 1 second timeout
+    timeout.tv_usec = 0; // 0 microseconds
+
+    if (setsockopt(data->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
+        perror("setsockopt (SO_RCVTIMEO)");
+        pthread_exit(NULL);
+    }
+    if (setsockopt(data->socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == -1) {
+        perror("setsockopt (SO_SNDTIMEO)");
+        pthread_exit(NULL);
+    }
+
     // Register the socket in the epoll instance
     event.events = EPOLLOUT; // Start by monitoring for readiness to send
     event.data.fd = data->socket_fd;
@@ -77,6 +92,8 @@ typedef struct {
 
     data->total_rtt = 0;
     data->total_messages = 0;
+    data->tx_cnt = 0;
+    data->rx_cnt = 0;
     data->request_rate = 0.0;
 
     for (int i = 0; i < num_requests; i++) {
@@ -87,6 +104,7 @@ typedef struct {
                 perror("sendto");
                 pthread_exit(NULL);
             }
+            data->tx_cnt++;
             
         // Wait for the socket to be ready
         int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
@@ -102,6 +120,7 @@ typedef struct {
             perror("recvfrom");
             pthread_exit(NULL);
         }
+        data->rx_cnt++;
 
         // Calculate RTT
         gettimeofday(&end, NULL);
@@ -152,6 +171,7 @@ void run_client() {
     long long total_rtt = 0;
     long total_messages = 0;
     float total_request_rate = 0.0;
+    long long lost_pkt_cnt = 0;
     for (int i = 0; i < num_client_threads; i++) {
         // Wait for the thread to complete
         pthread_join(threads[i], NULL); 
@@ -159,6 +179,7 @@ void run_client() {
         total_rtt += thread_data[i].total_rtt;
         total_messages += thread_data[i].total_messages;
         total_request_rate += thread_data[i].request_rate;
+        lost_pkt_cnt += thread_data[i].tx_cnt - thread_data[i].rx_cnt;
 
         // Close the epoll file descriptor
         close(thread_data[i].epoll_fd);
@@ -166,6 +187,7 @@ void run_client() {
 
     printf("Average RTT: %lld us\n", total_rtt / total_messages);
     printf("Total Request Rate: %f messages/s\n", total_request_rate);
+    printf("Total Packets Lost: %lld messages\n", lost_pkt_cnt);
 }
 
 void run_server() {
