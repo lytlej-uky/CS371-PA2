@@ -61,21 +61,12 @@ typedef struct {
 /*
  * This function runs in a separate client thread to handle communication with the server
  */
- void *client_thread_func(void *arg) {
+void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event, events[MAX_EVENTS];
     char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; // 16-byte message
     char recv_buf[MESSAGE_SIZE];
     struct timeval start, end;
-
-    struct timeval timeout;
-    timeout.tv_sec = 1;  // 1 second timeout
-    timeout.tv_usec = 0; // 0 microseconds
-
-    if (setsockopt(data->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
-        perror("setsockopt (SO_RCVTIMEO)");
-        pthread_exit(NULL);
-    }
 
     // Register the socket in the epoll instance
     event.events = EPOLLOUT; // Start by monitoring for readiness to send
@@ -100,11 +91,21 @@ typedef struct {
                 perror("sendto");
                 pthread_exit(NULL);
             }
-            data->tx_cnt++;
-            
-        // Wait for the socket to be ready
-        int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
-        if (wait_return == -1) {
+        data->tx_cnt++;
+
+        // Wait for the socket to be ready for receiving
+        event.events = EPOLLIN; // Change to monitor for readiness to receive
+        if (epoll_ctl(data->epoll_fd, EPOLL_CTL_MOD, data->socket_fd, &event) == -1) {
+            perror("epoll_ctl (EPOLL_CTL_MOD)");
+            pthread_exit(NULL);
+        }
+
+        int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 100); // 100ms timeout
+        if (wait_return == 0) {
+            // Timeout occurred
+            fprintf(stderr, "Timeout waiting for response\n");
+            continue;
+        } else if (wait_return == -1) {
             perror("epoll_wait");
             pthread_exit(NULL);
         }
