@@ -36,8 +36,11 @@ Please specify the group members here
 #include <pthread.h>
 
 #define MAX_EVENTS 64
-#define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
+#define MAX_PKT 4 // Maximum packet size in bytes
+#define MAX_SEQ 1 // Maximum sequence number
+
+#define inc(k) ((k) = ((k) + 1) % (MAX_SEQ+1)) // Increment sequence number
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -49,14 +52,25 @@ int num_requests = 1000000;
  */
 typedef struct {
     int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
-    int socket_fd;       /* File descriptor for the client socket connected to the server. */
+    int socket_fd;       /* File descriptor for the client socket connected to the server-> */
+    unsigned int client_id; // Client id number
     long long tx_cnt;    /* Total number of messages sent. */
     long long rx_cnt;    /* Total number of messages received. */
     long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
-    struct sockaddr_in server_addr; /* Server address. */
+    struct sockaddr_in server_addr; /* Server address */
     long total_messages; /* Total number of messages sent and received. */
-    float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
+    float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages-> */
 } client_thread_data_t;
+
+typedef unsigned int seq_nr_t; // Sequence number type
+typedef enum {d, ack, nak} frame_kind_t; // Frame kind definition
+typedef struct {
+    frame_kind_t kind; // Frame kind (data, ack, nak)
+    unsigned int client_id; // Client id number
+    seq_nr_t seq;     // Sequence number
+    seq_nr_t ack;     // Acknowledge number
+    char info[MAX_PKT];    // Packet information
+} frame_t; // Frame definition
 
 /*
  * This function runs in a separate client thread to handle communication with the server
@@ -64,9 +78,12 @@ typedef struct {
 void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event, events[MAX_EVENTS];
-    char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; // 16-byte message
-    char recv_buf[MESSAGE_SIZE];
+    char send_buf[sizeof(frame_t)];
+    char recv_buf[sizeof(frame_t)];
+    frame_t *s = (frame_t *)send_buf;
+    frame_t *r = (frame_t *)recv_buf;
     struct timeval start, end;
+    seq_nr_t next_frame_to_send = 0;
 
     // Register the socket in the epoll instance
     event.events = EPOLLOUT; // Start by monitoring for readiness to send
@@ -83,15 +100,19 @@ void *client_thread_func(void *arg) {
     data->rx_cnt = 0;
     data->request_rate = 0.0;
 
-    for (int i = 0; i < num_requests; i++) {
+    int idx = 0;
+    while (idx < num_requests) {
         // Send message to the server
+        snprintf(s->info, MAX_PKT, "ABC"); // Set frame data        
+        s->kind = d;
+        s->seq = next_frame_to_send;
+        s->client_id = data->client_id;
         gettimeofday(&start, NULL);
-        if (sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,
+        if (sendto(data->socket_fd, send_buf, sizeof(frame_t), 0,
             (struct sockaddr *)&data->server_addr, sizeof(data->server_addr)) == -1) {
                 perror("sendto");
                 pthread_exit(NULL);
             }
-        data->tx_cnt++;
 
         // Wait for the socket to be ready for receiving
         event.events = EPOLLIN; // Change to monitor for readiness to receive
@@ -103,26 +124,37 @@ void *client_thread_func(void *arg) {
         int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 100); // 100ms timeout
         if (wait_return == 0) {
             // Timeout occurred
-            fprintf(stderr, "Timeout waiting for response\n");
+            printf("Timeout occurred, will attempt to retransmit the frame\n");
             continue;
         } else if (wait_return == -1) {
             perror("epoll_wait");
             pthread_exit(NULL);
         }
+        data->tx_cnt++;
 
         // Receive response from the server
         socklen_t server_len = sizeof(data->server_addr);
-        if (recvfrom(data->socket_fd, recv_buf, MESSAGE_SIZE, 0,
+        if (recvfrom(data->socket_fd, recv_buf, sizeof(frame_t), 0,
                  (struct sockaddr *)&data->server_addr, &server_len) == -1) {
             perror("recvfrom");
             pthread_exit(NULL);
         }
+
+        if (r->ack != next_frame_to_send){
+            // frame damaged... try again
+            data->tx_cnt--;
+            printf("Frame damaged, expected ack_nr: %u, got: %d\n", next_frame_to_send, r->ack);
+            continue;
+        }
+
         data->rx_cnt++;
 
         // Calculate RTT
         gettimeofday(&end, NULL);
         data->total_messages++;
         data->total_rtt += (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+        inc(next_frame_to_send);
+        idx++;
     }
 
     // Calculate request rate
@@ -162,6 +194,7 @@ void run_client() {
 
     for (int i = 0; i < num_client_threads; i++) {
         // For each thread, launch a new one and pass the thread data
+        thread_data[i].client_id = i; // Assign a unique client ID to each thread
         pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
     }
 
@@ -192,9 +225,17 @@ void run_server() {
     int epoll_fd;
     struct epoll_event event;
     struct epoll_event events[MAX_EVENTS];
-    char recv_buf[MESSAGE_SIZE];
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
+
+    seq_nr_t frame_expected[num_client_threads];
+    for (int i = 0; i < num_client_threads; i++) {
+        frame_expected[i] = 0;
+    }
+    char recv_buf[sizeof(frame_t)];
+    char send_buf[sizeof(frame_t)];
+    frame_t *s = (frame_t *)send_buf;
+    frame_t *r = (frame_t *)recv_buf;
 
     // Create a UDP socket
     server_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -246,13 +287,33 @@ void run_server() {
         for (int i = 0; i < num_events; i++) {
             if (events[i].data.fd == server_fd) {
                 // Receive data from a client
-                int n = recvfrom(server_fd, recv_buf, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, &client_len);
+                int n = recvfrom(server_fd, recv_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, &client_len);
                 if (n <= 0) {
                     perror("recvfrom");
                 } else {
-                    // Echo the data back to the client
-                    if (sendto(server_fd, recv_buf, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, client_len) == -1) {
-                        perror("sendto");
+                    // Print the received data
+                    printf("Received from client %u: seq=%u, kind=%d\n", r->client_id, r->seq, r->kind);
+
+                    // Check if the received frame is valid
+                    if (r->kind == d && r->seq == frame_expected[r->client_id]) {
+                        s->kind = ack;
+                        s->client_id = r->client_id;
+                        s->ack = r->seq;
+                        // Echo the data back to the client
+                        if (sendto(server_fd, send_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                            perror("sendto");
+                        }
+                        inc(frame_expected[r->client_id]); // Increment the expected sequence number
+                    } 
+                    // allow even if duplicate (packets seem to get lost even from server to client)
+                    else if (r->kind == d && r->seq != frame_expected[r->client_id]) {
+                        s->kind = ack;
+                        s->client_id = r->client_id;
+                        s->ack = r->seq;
+                        // Echo the data back to the client
+                        if (sendto(server_fd, send_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                            perror("sendto");
+                        }
                     }
                 }
             }
