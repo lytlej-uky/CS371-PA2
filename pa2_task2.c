@@ -34,12 +34,13 @@ Please specify the group members here
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <pthread.h>
-#include <errno.h>
 
 #define MAX_EVENTS 64
-#define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
-#define MAX_SEQ 3
+#define MAX_PKT 4 // Maximum packet size in bytes
+#define MAX_SEQ 1 // Maximum sequence number
+
+#define inc(k) ((k) = ((k) + 1) % (MAX_SEQ+1)) // Increment sequence number
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -51,22 +52,25 @@ int num_requests = 1000000;
  */
 typedef struct {
     int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
-    int socket_fd;       /* File descriptor for the client socket connected to the server. */
-    long long tx_cnt;
-    long long rx_cnt;
+    int socket_fd;       /* File descriptor for the client socket connected to the server-> */
+    unsigned int client_id; // Client id number
+    long long tx_cnt;    /* Total number of messages sent. */
+    long long rx_cnt;    /* Total number of messages received. */
     long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
-    struct sockaddr_in server_addr;
+    struct sockaddr_in server_addr; /* Server address */
     long total_messages; /* Total number of messages sent and received. */
-    float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
-    unsigned int client_id;
+    float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages-> */
 } client_thread_data_t;
 
+typedef unsigned int seq_nr_t; // Sequence number type
+typedef enum {d, ack, nak} frame_kind_t; // Frame kind definition
 typedef struct {
-    unsigned int client_id;
-    unsigned int seq_nr;
-    int ack_nr;
-    char packet[MESSAGE_SIZE];
-} frame_t;
+    frame_kind_t kind; // Frame kind (data, ack, nak)
+    unsigned int client_id; // Client id number
+    seq_nr_t seq;     // Sequence number
+    seq_nr_t ack;     // Acknowledge number
+    char info[MAX_PKT];    // Packet information
+} frame_t; // Frame definition
 
 /*
  * This function runs in a separate client thread to handle communication with the server
@@ -75,16 +79,11 @@ void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event, events[MAX_EVENTS];
     char send_buf[sizeof(frame_t)];
-    frame_t *frame = (frame_t *)send_buf;
-
-    // Set the client_id, seq_nr, and frame data
-    frame->client_id = data->client_id;
-    frame->seq_nr = 0; // Initialize to 0
-    frame->ack_nr = -1; // Initialize ack_nr to -1
-    snprintf(frame->packet, MESSAGE_SIZE, "ABCDEF"); // Set frame data
     char recv_buf[sizeof(frame_t)];
+    frame_t *s = (frame_t *)send_buf;
+    frame_t *r = (frame_t *)recv_buf;
     struct timeval start, end;
-    unsigned int seq_nr = 0;
+    seq_nr_t next_frame_to_send = 0;
 
     // Register the socket in the epoll instance
     event.events = EPOLLOUT; // Start by monitoring for readiness to send
@@ -101,10 +100,13 @@ void *client_thread_func(void *arg) {
     data->rx_cnt = 0;
     data->request_rate = 0.0;
 
-    int i = 0;
-    while (i < num_requests) {
-        frame->seq_nr = seq_nr;
+    int idx = 0;
+    while (idx < num_requests) {
         // Send message to the server
+        snprintf(s->info, MAX_PKT, "ABC"); // Set frame data        
+        s->kind = d;
+        s->seq = next_frame_to_send;
+        s->client_id = data->client_id;
         gettimeofday(&start, NULL);
         if (sendto(data->socket_fd, send_buf, sizeof(frame_t), 0,
             (struct sockaddr *)&data->server_addr, sizeof(data->server_addr)) == -1) {
@@ -119,10 +121,10 @@ void *client_thread_func(void *arg) {
             pthread_exit(NULL);
         }
 
-        int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 2000); // 1000ms timeout
+        int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 100); // 100ms timeout
         if (wait_return == 0) {
             // Timeout occurred
-            printf("Timeout occurred, no response from server\n");
+            printf("Timeout occurred, will attempt to retransmit the frame\n");
             continue;
         } else if (wait_return == -1) {
             perror("epoll_wait");
@@ -137,11 +139,11 @@ void *client_thread_func(void *arg) {
             perror("recvfrom");
             pthread_exit(NULL);
         }
-        frame_t *frame_rec = (frame_t *)recv_buf;
-        if (frame_rec->ack_nr != seq_nr){
+
+        if (r->ack != next_frame_to_send){
             // frame damaged... try again
             data->tx_cnt--;
-            printf("Frame damaged, expected ack_nr: %u, got: %d\n", seq_nr, frame_rec->ack_nr);
+            printf("Frame damaged, expected ack_nr: %u, got: %d\n", next_frame_to_send, r->ack);
             continue;
         }
 
@@ -151,8 +153,8 @@ void *client_thread_func(void *arg) {
         gettimeofday(&end, NULL);
         data->total_messages++;
         data->total_rtt += (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
-        seq_nr = (seq_nr + 1) % MAX_SEQ; 
-        i++;
+        inc(next_frame_to_send);
+        idx++;
     }
 
     // Calculate request rate
@@ -192,7 +194,7 @@ void run_client() {
 
     for (int i = 0; i < num_client_threads; i++) {
         // For each thread, launch a new one and pass the thread data
-        thread_data[i].client_id = i;
+        thread_data[i].client_id = i; // Assign a unique client ID to each thread
         pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
     }
 
@@ -200,8 +202,6 @@ void run_client() {
     long total_messages = 0;
     float total_request_rate = 0.0;
     long long lost_pkt_cnt = 0;
-    long long total_sent = 0;
-    long long total_received = 0;
     for (int i = 0; i < num_client_threads; i++) {
         // Wait for the thread to complete
         pthread_join(threads[i], NULL); 
@@ -210,8 +210,6 @@ void run_client() {
         total_messages += thread_data[i].total_messages;
         total_request_rate += thread_data[i].request_rate;
         lost_pkt_cnt += thread_data[i].tx_cnt - thread_data[i].rx_cnt;
-        total_sent += thread_data[i].tx_cnt;
-        total_received += thread_data[i].rx_cnt;
 
         // Close the epoll file descriptor
         close(thread_data[i].epoll_fd);
@@ -220,26 +218,24 @@ void run_client() {
     printf("Average RTT: %lld us\n", total_rtt / total_messages);
     printf("Total Request Rate: %f messages/s\n", total_request_rate);
     printf("Total Packets Lost: %lld messages\n", lost_pkt_cnt);
-    printf("Total Packets Sent: %lld messages\n", total_sent);
-    printf("Total Packets Received: %lld messages\n", total_received);
 }
 
 void run_server() {
     int server_fd;
     int epoll_fd;
-    int expected_seq[num_client_threads];
-    for (int i = 0; i < num_client_threads; i++) {
-        expected_seq[i] = 0;
-    }
-    int ack_frames[num_client_threads];
-    for (int i = 0; i < num_client_threads; i++) {
-        ack_frames[i] = 0;
-    }
     struct epoll_event event;
     struct epoll_event events[MAX_EVENTS];
-    char recv_buf[sizeof(frame_t)];
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
+
+    seq_nr_t frame_expected[num_client_threads];
+    for (int i = 0; i < num_client_threads; i++) {
+        frame_expected[i] = 0;
+    }
+    char recv_buf[sizeof(frame_t)];
+    char send_buf[sizeof(frame_t)];
+    frame_t *s = (frame_t *)send_buf;
+    frame_t *r = (frame_t *)recv_buf;
 
     // Create a UDP socket
     server_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -295,33 +291,29 @@ void run_server() {
                 if (n <= 0) {
                     perror("recvfrom");
                 } else {
-                    frame_t *frame = (frame_t *)recv_buf;
-                    char send_buf[sizeof(frame_t)];
-                    frame_t *send_frame = (frame_t *)send_buf;
-                    send_frame->client_id = frame->client_id;
-                    send_frame->seq_nr = 0;
-                    send_frame->ack_nr = -1; // Initialize ack_nr to -1
-                    printf("Received message from client_id: %u, seq_nr: %u, ack_nr:%d packet: %s\n",
-                           frame->client_id, frame->seq_nr, frame->ack_nr, frame->packet);
+                    // Print the received data
+                    printf("Received from client %u: seq=%u, kind=%d\n", r->client_id, r->seq, r->kind);
 
-                    printf("%d, %d, %d, %d\n", frame->client_id, num_client_threads, expected_seq[frame->client_id], frame->seq_nr);
-
-                    if (frame->client_id <= num_client_threads && expected_seq[frame->client_id] == frame->seq_nr) {
-                        send_frame->ack_nr = expected_seq[frame->client_id];
-                        expected_seq[frame->client_id] = (expected_seq[frame->client_id] + 1) % MAX_SEQ;
-                        ack_frames[frame->client_id]++;
-                        printf("Sending ack_nr: %d to client_id: %u\n", send_frame->ack_nr, frame->client_id);
-                    }
-
-                    // Echo the data back to the client
-                    printf("Client address: %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                    if (sendto(server_fd, send_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
-                        fprintf(stderr, "sendto failed: %s (client_id: %u, seq_nr: %u, ack_nr: %d, client address: %s:%d)\n",
-                                strerror(errno), send_frame->client_id, send_frame->seq_nr, frame->ack_nr,
-                                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                    } else {
-                        printf("Sent message to client_id: %u, ack_nr: %u, packet: %s, expected: %d, got: %u, ack_frames: %d\n",
-                               frame->client_id, frame->ack_nr, frame->packet, expected_seq[frame->client_id], frame->seq_nr, ack_frames[frame->client_id]);
+                    // Check if the received frame is valid
+                    if (r->kind == d && r->seq == frame_expected[r->client_id]) {
+                        s->kind = ack;
+                        s->client_id = r->client_id;
+                        s->ack = r->seq;
+                        // Echo the data back to the client
+                        if (sendto(server_fd, send_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                            perror("sendto");
+                        }
+                        inc(frame_expected[r->client_id]); // Increment the expected sequence number
+                    } 
+                    // allow even if duplicate (packets seem to get lost even from server to client)
+                    else if (r->kind == d && r->seq != frame_expected[r->client_id]) {
+                        s->kind = ack;
+                        s->client_id = r->client_id;
+                        s->ack = r->seq;
+                        // Echo the data back to the client
+                        if (sendto(server_fd, send_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                            perror("sendto");
+                        }
                     }
                 }
             }
