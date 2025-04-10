@@ -50,10 +50,10 @@ int num_requests = 1000000;
 typedef struct {
     int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
     int socket_fd;       /* File descriptor for the client socket connected to the server. */
-    long long tx_cnt;
-    long long rx_cnt;
+    long long tx_cnt;    /* Total number of messages sent. */
+    long long rx_cnt;    /* Total number of messages received. */
     long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
-    struct sockaddr_in server_addr;
+    struct sockaddr_in server_addr; /* Server address. */
     long total_messages; /* Total number of messages sent and received. */
     float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
 } client_thread_data_t;
@@ -251,7 +251,7 @@ void run_server() {
                     perror("recvfrom");
                 } else {
                     // Echo the data back to the client
-                    if (sendto(server_fd, recv_buf, n, 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                    if (sendto(server_fd, recv_buf, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, client_len) == -1) {
                         perror("sendto");
                     }
                 }
