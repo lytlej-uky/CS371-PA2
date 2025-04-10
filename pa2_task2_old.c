@@ -34,11 +34,12 @@ Please specify the group members here
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <errno.h>
 
 #define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
-#define MAX_SEQ 1000
+#define MAX_SEQ 3
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -118,9 +119,10 @@ void *client_thread_func(void *arg) {
             pthread_exit(NULL);
         }
 
-        int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 1000); // 100ms timeout
+        int wait_return = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 2000); // 1000ms timeout
         if (wait_return == 0) {
             // Timeout occurred
+            printf("Timeout occurred, no response from server\n");
             continue;
         } else if (wait_return == -1) {
             perror("epoll_wait");
@@ -139,6 +141,7 @@ void *client_thread_func(void *arg) {
         if (frame_rec->ack_nr != seq_nr){
             // frame damaged... try again
             data->tx_cnt--;
+            printf("Frame damaged, expected ack_nr: %u, got: %d\n", seq_nr, frame_rec->ack_nr);
             continue;
         }
 
@@ -197,6 +200,8 @@ void run_client() {
     long total_messages = 0;
     float total_request_rate = 0.0;
     long long lost_pkt_cnt = 0;
+    long long total_sent = 0;
+    long long total_received = 0;
     for (int i = 0; i < num_client_threads; i++) {
         // Wait for the thread to complete
         pthread_join(threads[i], NULL); 
@@ -205,6 +210,8 @@ void run_client() {
         total_messages += thread_data[i].total_messages;
         total_request_rate += thread_data[i].request_rate;
         lost_pkt_cnt += thread_data[i].tx_cnt - thread_data[i].rx_cnt;
+        total_sent += thread_data[i].tx_cnt;
+        total_received += thread_data[i].rx_cnt;
 
         // Close the epoll file descriptor
         close(thread_data[i].epoll_fd);
@@ -213,13 +220,21 @@ void run_client() {
     printf("Average RTT: %lld us\n", total_rtt / total_messages);
     printf("Total Request Rate: %f messages/s\n", total_request_rate);
     printf("Total Packets Lost: %lld messages\n", lost_pkt_cnt);
+    printf("Total Packets Sent: %lld messages\n", total_sent);
+    printf("Total Packets Received: %lld messages\n", total_received);
 }
 
 void run_server() {
     int server_fd;
     int epoll_fd;
-    unsigned int expected_seq[num_client_threads];
-    memset(expected_seq, 0, sizeof(expected_seq));
+    int expected_seq[num_client_threads];
+    for (int i = 0; i < num_client_threads; i++) {
+        expected_seq[i] = 0;
+    }
+    int ack_frames[num_client_threads];
+    for (int i = 0; i < num_client_threads; i++) {
+        ack_frames[i] = 0;
+    }
     struct epoll_event event;
     struct epoll_event events[MAX_EVENTS];
     char recv_buf[sizeof(frame_t)];
@@ -281,24 +296,32 @@ void run_server() {
                     perror("recvfrom");
                 } else {
                     frame_t *frame = (frame_t *)recv_buf;
-                    printf("Received message from client_id: %u, seq_nr: %u, packet: %s\n",
-                           frame->client_id, frame->seq_nr, frame->packet);
+                    char send_buf[sizeof(frame_t)];
+                    frame_t *send_frame = (frame_t *)send_buf;
+                    send_frame->client_id = frame->client_id;
+                    send_frame->seq_nr = 0;
+                    send_frame->ack_nr = -1; // Initialize ack_nr to -1
+                    printf("Received message from client_id: %u, seq_nr: %u, ack_nr:%d packet: %s\n",
+                           frame->client_id, frame->seq_nr, frame->ack_nr, frame->packet);
 
                     printf("%d, %d, %d, %d\n", frame->client_id, num_client_threads, expected_seq[frame->client_id], frame->seq_nr);
 
                     if (frame->client_id <= num_client_threads && expected_seq[frame->client_id] == frame->seq_nr) {
-                        frame->ack_nr = frame->seq_nr;
+                        send_frame->ack_nr = expected_seq[frame->client_id];
                         expected_seq[frame->client_id] = (expected_seq[frame->client_id] + 1) % MAX_SEQ;
-                    
+                        ack_frames[frame->client_id]++;
+                        printf("Sending ack_nr: %d to client_id: %u\n", send_frame->ack_nr, frame->client_id);
                     }
 
                     // Echo the data back to the client
                     printf("Client address: %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                    if (sendto(server_fd, recv_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
-                        perror("sendto");
+                    if (sendto(server_fd, send_buf, sizeof(frame_t), 0, (struct sockaddr *)&client_addr, client_len) == -1) {
+                        fprintf(stderr, "sendto failed: %s (client_id: %u, seq_nr: %u, ack_nr: %d, client address: %s:%d)\n",
+                                strerror(errno), send_frame->client_id, send_frame->seq_nr, frame->ack_nr,
+                                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
                     } else {
-                        printf("Sent message to client_id: %u, ack_nr: %u, packet: %s, expected: %d, got: %u\n",
-                               frame->client_id, frame->ack_nr, frame->packet, expected_seq[frame->client_id], frame->seq_nr);
+                        printf("Sent message to client_id: %u, ack_nr: %u, packet: %s, expected: %d, got: %u, ack_frames: %d\n",
+                               frame->client_id, frame->ack_nr, frame->packet, expected_seq[frame->client_id], frame->seq_nr, ack_frames[frame->client_id]);
                     }
                 }
             }
