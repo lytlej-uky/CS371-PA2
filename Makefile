@@ -1,4 +1,4 @@
-NUM?=100
+NUM?=1
 
 run_server1: pa2_1
 	./pa2_1 server 127.0.0.1 12345
@@ -18,13 +18,10 @@ run_server2: pa2_2
 	./pa2_2 server 127.0.0.1 12345
 
 run_client2: pa2_2
-	./pa2_2 client 127.0.0.1 12345 4 10000
-
-run_client_many2: pa2_2
 	./pa2_2 client 127.0.0.1 12345 $(NUM) 1000
 
 pa2_2: pa2_task2.c
-	gcc -g -o pa2_2 pa2_task2.c -pthread
+	gcc -g -o pa2_2 pa2_task2_2.c -pthread
 
 clean:
 	rm -f pa2_1 pa2_2
